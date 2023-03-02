@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Dataflow;
 
@@ -17,9 +18,16 @@ public sealed class ComplexRequestProcessor : IRequestProcessor
     private readonly ILowLevelNetworkAdapter _networkAdapter;
     private readonly TimeSpan _requestTimeout;
 
-    private record RequestWrapper(Request Request, CancellationToken Token);
+    private const int COLLECTIONS_CAPACITY = 100000;
+    private const int ADAPTER_MAX_PARALLEL = 1;
+    //private readonly TimeSpan MESSAGE_TTL = TimeSpan.FromSeconds(60);
+
+    private readonly ConcurrentDictionary<Guid, Response?> _buffer;
     record TransformResult<T>(T Result, ExceptionDispatchInfo? Error);
-    private TransformBlock<RequestWrapper, TransformResult<Response?>>? _requestQueue = null;
+    private TransformBlock<(Request, CancellationToken), TransformResult<Response?>>? _readBlock = null;
+    private ActionBlock<(Request, CancellationToken)>? _writeBlock = null;
+    private BroadcastBlock<(Request, CancellationToken)>? _broadcastBlock = null;
+
 
     public ComplexRequestProcessor(ILowLevelNetworkAdapter networkAdapter, TimeSpan requestTimeout)
     {
@@ -28,62 +36,87 @@ public sealed class ComplexRequestProcessor : IRequestProcessor
 
         _networkAdapter = networkAdapter;
         _requestTimeout = requestTimeout;
+        _buffer = new ConcurrentDictionary<Guid, Response?>();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         return Task.Run(async () =>
         {
-            if (_requestQueue is not null)
+            if (_readBlock is not null)
             {
                 await StopAsync(cancellationToken);
             }
-            ExecutionDataflowBlockOptions _options = new()
+
+            var blockOptions = new ExecutionDataflowBlockOptions()
             {
-                MaxDegreeOfParallelism = 1,
-                EnsureOrdered = true
-                //SingleProducerConstrained = true
+                MaxDegreeOfParallelism = ADAPTER_MAX_PARALLEL,
+                BoundedCapacity = COLLECTIONS_CAPACITY,
             };
-            _requestQueue = new TransformBlock<RequestWrapper, TransformResult<Response?>>(async (wrapper) =>
+
+            // Блок для чтения информации из адаптера
+            // В цикле вычитывает ответы до тех пор, пока не получит ответ с нужным Id, либо не сработает таймаут операции,
+            // либо не будет превышено максимальное число попыток, если таймаут слишком большой
+            _readBlock = new TransformBlock<(Request, CancellationToken), TransformResult<Response?>>(async message =>
             {
-                Debug.WriteLine($"Preparing request: {wrapper.Request.Id}");
+                (Request request, CancellationToken token) = message;
+                var response = _buffer[request.Id];
+                var _readCounter = 0;
                 try
                 {
-                    var cts = new CancellationTokenSource(_requestTimeout);
-                    // кажется, что для полноценной реализации работы с полнодуплексным сокетом
-                    // модель данных должна быть немного сложнее
-                    // в данном случае считаем что апаптер сам позаботится о правильном порядке сообщений
-                    var writeTask = _networkAdapter.WriteAsync(wrapper.Request, cts.Token);
-                    var readTask = _networkAdapter.ReadAsync(cts.Token);
-                    var bothTask = Task.WhenAll(writeTask, readTask);
-                    await Task.WhenAny(
-                        bothTask,
-                        Task.Delay(_requestTimeout, wrapper.Token)
-                    );
-                    if (!bothTask.IsCompleted)
+                    // можно ввести ограничение на количество попыток чтения, но тогда таймаут может отрабатывать некорректно
+                    while (response is null || response.Id != request.Id)
                     {
-                        // согласно заданию мы должны отменять таск,
-                        // иначе можно было бы выбрасывать TimeoutException
-                        return new TransformResult<Response?>(null, ExceptionDispatchInfo.Capture(new OperationCanceledException("Timeout expired")));
+                        token.ThrowIfCancellationRequested();
+                        Interlocked.Increment(ref _readCounter);
+                        Debug.WriteLine($"Read {_readCounter} started: {request.Id}");
+                        response = await _networkAdapter.ReadAsync(token);
+                        Debug.WriteLine($"Read {_readCounter} completed: {response.Id}");
+                        if (_buffer.ContainsKey(response.Id) && _buffer[response.Id] == null)
+                        {
+                            _buffer[response.Id] = response;
+                        }
                     }
-                    Debug.WriteLine($"Request: {wrapper.Request.Id} returned response {readTask.Result.Id}");
-                    return new TransformResult<Response?>(readTask.Result, null);
+                    
                 }
-                catch (OperationCanceledException ex)
+                // ловим как OperationCanceledException, так и остальные ошибки чтобы обработать
+                // или бросить дальше в методе, получающем результат чтения
+                catch (Exception ex)
                 {
-                    if (ex.CancellationToken.Equals(wrapper.Token))
-                    {
-                        Debug.WriteLine($"Request {wrapper.Request.Id} has been cancelled");
-                        return new TransformResult<Response?>(null, ExceptionDispatchInfo.Capture(ex));
-                    }
-                    Debug.WriteLine($"Request {wrapper.Request.Id} reached it's timeout");
-                    return new TransformResult<Response?>(null, ExceptionDispatchInfo.Capture(new TimeoutException("Timeout expired")));
+                    return new TransformResult<Response?>(null, ExceptionDispatchInfo.Capture(ex));
                 }
-                catch (AggregateException ex)
+                return new TransformResult<Response?>(response, null);
+            }, blockOptions);
+
+            // Блок для записи информации в адаптер
+            _writeBlock = new ActionBlock<(Request, CancellationToken)>(async (message) =>
+            {
+                (Request request, CancellationToken token) = message;
+                Debug.WriteLine($"Write started: {request.Id}");
+                try
                 {
-                    return new TransformResult<Response?>(null, ExceptionDispatchInfo.Capture(ex.InnerExceptions.First()));
+                    await _networkAdapter.WriteAsync(request, token);
                 }
-            }, _options);
+                catch (OperationCanceledException)
+                {
+                    Debug.WriteLine($"Write completed with cancellation");
+                }
+                // ошибка при однократной записи не должна рушить всю очередь
+                // но логику обработки, конечно, нужно расширять
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Write completed with error: {ex.Message}");
+                }
+                Debug.WriteLine($"Write completed");
+            }, blockOptions);
+
+            // Блок, который формирует начальную очередь сообщений и рассылает их дальше по пайплайну
+            // параллельно в блоки чтения и записи
+            _broadcastBlock = new BroadcastBlock<(Request, CancellationToken)>((message) => message, new DataflowBlockOptions { EnsureOrdered = true });
+            var linkOptions = new DataflowLinkOptions { PropagateCompletion = true };
+            _broadcastBlock.LinkTo(_writeBlock, linkOptions);
+            _broadcastBlock.LinkTo(_readBlock, linkOptions);
+
         }, cancellationToken);
     }
 
@@ -91,28 +124,41 @@ public sealed class ComplexRequestProcessor : IRequestProcessor
     {
         return Task.Run(async () =>
         {
-            if (_requestQueue is null)
+            if (_readBlock is null || _writeBlock is null || _broadcastBlock is null)
             {
-                // Здесь и далее выбрана стратегия "громкого падения", поскольку
-                // в нормальной ситуации метод не должен быть вызван до инициализации
-                // Но можно и ограничиться возвратом Task.CompletedTask, а в SendAsync вызывать StartAsync
                 throw new InvalidOperationException("Stop method called before Start");
             }
-            _requestQueue.Complete();
-            await _requestQueue.Completion;
+            _broadcastBlock.Complete();
+            _writeBlock.Complete();
+            _readBlock.Complete();
+            await Task.WhenAll(_writeBlock.Completion, _readBlock.Completion);
+            _buffer.Clear();
         }, cancellationToken);
     }
 
     public async Task<Response> SendAsync(Request request, CancellationToken cancellationToken)
     {
-        if (_requestQueue is null)
+        if (_readBlock is null || _writeBlock is null || _broadcastBlock is null)
         {
             throw new InvalidOperationException("Send method called before Start");
         }
-        _requestQueue.Post(new RequestWrapper(request, cancellationToken));
-        var transformResult = await _requestQueue.ReceiveAsync(cancellationToken);
-        if (transformResult.Error != null)
-            transformResult.Error.Throw();
-        return transformResult.Result;
+        using var timeoutCts = new CancellationTokenSource(_requestTimeout);
+        var timeoutToken = timeoutCts.Token;
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutToken);
+        var message = (request, linkedCts.Token);
+        _buffer[request.Id] = null;
+        await _broadcastBlock.SendAsync(message);
+        var res = await _readBlock.ReceiveAsync(cancellationToken);
+        if (res.Error is not null)
+        {
+            Debug.WriteLine($"Request {request.Id} failed: {res.Error.SourceException.Message}");
+            res.Error.Throw();
+        }
+        Debug.WriteLine($"Method SendAsync returned response {res.Result!.Id} on request {request.Id}");
+        //if (!_buffer.Remove(request.Id, out var bufferedValue) || bufferedValue?.Id != res.Result.Id)
+        //{
+        //    throw new InvalidOperationException("Response validation failed");
+        //}
+        return res.Result;
     }
 }

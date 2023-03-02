@@ -18,11 +18,12 @@ namespace Multiplexing.RequestProcessor.Tests
         }
 
         [Theory]
-        [InlineData(10)]
-        public async void SendAsync_MultipleTaskProcessing_ReturnsCorrectReponses(int taskCount)
+        [InlineData(10, 100, 10)]
+        [InlineData(10, 10, 100)]
+        public async void SendAsync_MultipleTaskProcessing_ReturnsCorrectReponses(int taskCount, int writeDelay, int readDelay)
         {
-            var adapter = new FakeLowLevelNetworkAdapter(100, 100);
-            var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromSeconds(2));
+            var adapter = new FakeLowLevelNetworkAdapter(writeDelay, readDelay);
+            var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromSeconds(5));
             await processor.StartAsync(CancellationToken.None);
             var tasks = new Dictionary<Guid, Task<Response>>();
             for (var i = 0; i < taskCount; i++)
@@ -117,7 +118,7 @@ namespace Multiplexing.RequestProcessor.Tests
             Assert.Fail("Timeout works wrong");
         }
 
-        private async Task CycleTest(FakeLowLevelNetworkAdapter adapter,
+        private async Task CycleTimeoutTest(FakeLowLevelNetworkAdapter adapter,
                                      IRequestProcessor processor,
                                      int timeout,
                                      int delayMultiplier,
@@ -129,22 +130,21 @@ namespace Multiplexing.RequestProcessor.Tests
             {
                 var request = new Request(Guid.NewGuid());
                 var delay = delayMultiplier * i;
-                var delaySum = delay * Convert.ToInt32(increaseReqTimeout) + delay * Convert.ToInt32(increaseRespTimeout);
                 try
                 {
                     adapter.RequestDelay = increaseReqTimeout ? delay : 0;
                     adapter.ResponseDelay = increaseRespTimeout ? delay : 0;
-                    var res = await processor.SendAsync(request, CancellationToken.None);
+                    var response = await processor.SendAsync(request, CancellationToken.None);
                 }
                 catch (OperationCanceledException)
                 {
-                    if (delaySum < timeout)
+                    if (delay < timeout)
                     {
                         Assert.Fail("Operation cancelled unexpectedly");
                     }
                     continue;
                 }
-                if (delaySum >= timeout)
+                if (delay >= timeout)
                 {
                     Assert.Fail("Operation not cancelled by timeout");
                 }
@@ -153,6 +153,7 @@ namespace Multiplexing.RequestProcessor.Tests
 
         [Theory]
         [InlineData(500, 200, 5, true, false)]
+        [InlineData(500, 200, 5, false, true)]
         public async Task SendAsync_MultipleRequestProcessing_RequestTimeoutsCorrectrly(int timeout,
                                                                                         int delayMultiplier,
                                                                                         int cycles,
@@ -162,22 +163,7 @@ namespace Multiplexing.RequestProcessor.Tests
             var adapter = new FakeLowLevelNetworkAdapter(0, 0);
             var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromMilliseconds(timeout));
             await processor.StartAsync(CancellationToken.None);
-            await CycleTest(adapter, processor, timeout, delayMultiplier, cycles, increaseReqTimeout, increaseRespTimeout);
-            await processor.StopAsync(CancellationToken.None);
-        }
-
-        [Theory]
-        [InlineData(500, 200, 5, false, true)]
-        public async Task SendAsync_MultipleRequestProcessing_ResponseTimeoutsCorrectrly(int timeout,
-                                                                                        int delayMultiplier,
-                                                                                        int cycles,
-                                                                                        bool increaseReqTimeout,
-                                                                                        bool increaseRespTimeout)
-        {
-            var adapter = new FakeLowLevelNetworkAdapter(0, 0);
-            var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromMilliseconds(timeout));
-            await processor.StartAsync(CancellationToken.None);
-            await CycleTest(adapter, processor, timeout, delayMultiplier, cycles, increaseReqTimeout, increaseRespTimeout);
+            await CycleTimeoutTest(adapter, processor, timeout, delayMultiplier, cycles, increaseReqTimeout, increaseRespTimeout);
             await processor.StopAsync(CancellationToken.None);
         }
     }
