@@ -18,14 +18,39 @@ public sealed class ComplexRequestProcessor : IRequestProcessor
     private readonly ILowLevelNetworkAdapter _networkAdapter;
     private readonly TimeSpan _requestTimeout;
 
+    /// <summary>
+    /// Нет прямой необходимости ограничивать очередь, но это поможет отловить ошибки при эксплуатации
+    /// </summary>
     private const int COLLECTIONS_CAPACITY = 100000;
+    
+    /// <summary>
+    /// Количество потоков для работы с адаптером
+    /// </summary>
     private const int ADAPTER_MAX_PARALLEL = 1;
-    //private readonly TimeSpan MESSAGE_TTL = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// Буфер полученных результатов чтения
+    /// </summary>
     private readonly ConcurrentDictionary<Guid, Response?> _buffer;
+
+    /// <summary>
+    /// Обёртка для проброса ошибок при чтении совместно с результатом операции
+    /// </summary>
     record TransformResult<T>(T Result, ExceptionDispatchInfo? Error);
+
+    /// <summary>
+    /// Блок чтения информации из адаптера
+    /// </summary>
     private TransformBlock<(Request, CancellationToken), TransformResult<Response?>>? _readBlock = null;
+
+    /// <summary>
+    /// Блок записи информации в адаптер
+    /// </summary>
     private ActionBlock<(Request, CancellationToken)>? _writeBlock = null;
+
+    /// <summary>
+    /// Блок распределения сообщений по блокам чтения и записи
+    /// </summary>
     private BroadcastBlock<(Request, CancellationToken)>? _broadcastBlock = null;
 
 
@@ -155,10 +180,10 @@ public sealed class ComplexRequestProcessor : IRequestProcessor
             res.Error.Throw();
         }
         Debug.WriteLine($"Method SendAsync returned response {res.Result!.Id} on request {request.Id}");
-        //if (!_buffer.Remove(request.Id, out var bufferedValue) || bufferedValue?.Id != res.Result.Id)
-        //{
-        //    throw new InvalidOperationException("Response validation failed");
-        //}
+        if (!_buffer.Remove(request.Id, out var bufferedValue) || bufferedValue?.Id != res.Result.Id)
+        {
+            throw new InvalidOperationException("Response validation failed");
+        }
         return res.Result;
     }
 }

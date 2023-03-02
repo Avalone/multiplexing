@@ -20,10 +20,12 @@ namespace Multiplexing.RequestProcessor.Tests
         [Theory]
         [InlineData(10, 100, 10)]
         [InlineData(10, 10, 100)]
+        [InlineData(100, 10, 100)]
+        [InlineData(100, 100, 10)]
         public async void SendAsync_MultipleTaskProcessing_ReturnsCorrectReponses(int taskCount, int writeDelay, int readDelay)
         {
             var adapter = new FakeLowLevelNetworkAdapter(writeDelay, readDelay);
-            var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromSeconds(5));
+            var processor = new ComplexRequestProcessor(adapter, TimeSpan.FromHours(1));
             await processor.StartAsync(CancellationToken.None);
             var tasks = new Dictionary<Guid, Task<Response>>();
             for (var i = 0; i < taskCount; i++)
